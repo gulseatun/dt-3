@@ -353,102 +353,102 @@ class AutonomousNavigator:
         self.viz_pub.publish(msg)
 
     def run(self):
-        rate = rospy.Rate(10)
+            rate = rospy.Rate(10)
 
-        while not rospy.is_shutdown():
-            if self.path_index >= len(self.path) - 1:
-                self.stop_robot()
-                rospy.loginfo("Goal Reached")
-                break
-
-            if self.last_frame is None:
-                self.stop_robot()
-                rate.sleep()
-                continue
-
-            frame = cv2.undistort(self.last_frame.copy(), K, D)
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
-            corners, ids = self.detect_markers(gray)
-            self.process_detections(frame, corners, ids)
-
-            next_node_id = self.path[self.path_index + 1]
-            next_node_str = f"N{next_node_id}"
-
-            if next_node_str in self.visible_tags:
-                self.turn_mode = False
-                self.state = "TRACKING"
-                
-                # ZAMANLAYICI KİLİDİ ÇÖZÜMÜ: Sayacı sadece hedefi gördüğümüzde güncelliyoruz.
-                self.last_seen_time = rospy.Time.now().to_sec()
-
-                tag_info = self.visible_tags[next_node_str]
-                x_err = tag_info["x_err"]
-                dist = tag_info["dist"]
-
-                rospy.loginfo_throttle(
-                    0.2,
-                    f"Durum:{self.state} | Hedef:{next_node_str} | x_err:{x_err:.3f} | dist:{dist:.3f} | cnt:{self.reach_counter}"
-                )
-
-                if dist < REACH_DISTANCE and abs(x_err) < REACH_XERR:
-                    self.reach_counter += 1
-                else:
-                    self.reach_counter = 0
-
-                if self.reach_counter >= REQUIRED_REACH_COUNT:
+            while not rospy.is_shutdown():
+                if self.path_index >= len(self.path) - 1:
                     self.stop_robot()
-                    self.current_node = next_node_id
-                    self.path_index += 1
-                    self.reach_counter = 0
+                    rospy.loginfo("Goal Reached")
+                    break
 
-                    if self.path_index < len(self.path) - 1:
-                        self.search_turn_dir = self.get_turn_direction()
-                        self.turn_mode = True
-
-                    rospy.loginfo(f"--> Ulaşıldı: {next_node_str}")
-                    rospy.sleep(0.5)
-                    self.publish_visualization(frame)
+                if self.last_frame is None:
+                    self.stop_robot()
                     rate.sleep()
                     continue
 
-                # Basit P kontrol
-                kp_omega = 2.5
-                omega = -kp_omega * x_err
-                omega = max(-2.0, min(2.0, omega))
+                frame = cv2.undistort(self.last_frame.copy(), K, D)
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-                v = 0.18
-                if abs(x_err) > 0.15:
-                    v = 0.06
+                corners, ids = self.detect_markers(gray)
+                self.process_detections(frame, corners, ids)
 
-                self.drive(v, omega)
+                next_node_id = self.path[self.path_index + 1]
+                next_node_str = f"N{next_node_id}"
 
-            else:
-                self.state = "SEARCHING"
-                self.reach_counter = 0
+                if next_node_str in self.visible_tags:
+                    self.turn_mode = False
+                    self.state = "TRACKING"
+                    
+                    # ZAMANLAYICI KİLİDİ ÇÖZÜMÜ: Sayacı sadece hedefi gördüğümüzde güncelliyoruz.
+                    self.last_seen_time = rospy.Time.now().to_sec()
 
-                lost_time = rospy.Time.now().to_sec() - self.last_seen_time
-                if lost_time > 0.5:
-                    if self.turn_mode:
-                        if self.search_turn_dir == 0.0:
-                            # Düz devam etmesi gerekiyorsa çok hafif ileri git
-                            self.drive(0.08, 0.0)
-                        else:
-                            # Sağa veya sola dön
-                            self.drive(0.0, 0.45 * self.search_turn_dir)
+                    tag_info = self.visible_tags[next_node_str]
+                    x_err = tag_info["x_err"]
+                    dist = tag_info["dist"]
+
+                    rospy.loginfo_throttle(
+                        0.2,
+                        f"Durum:{self.state} | Hedef:{next_node_str} | x_err:{x_err:.3f} | dist:{dist:.3f} | cnt:{self.reach_counter}"
+                    )
+
+                    if dist < REACH_DISTANCE and abs(x_err) < REACH_XERR:
+                        self.reach_counter += 1
                     else:
-                        self.drive(0.0, 0.45)
+                        self.reach_counter = 0
+
+                    if self.reach_counter >= REQUIRED_REACH_COUNT:
+                        self.stop_robot()
+                        self.current_node = next_node_id
+                        self.path_index += 1
+                        self.reach_counter = 0
+
+                        if self.path_index < len(self.path) - 1:
+                            self.search_turn_dir = self.get_turn_direction()
+                            self.turn_mode = True
+
+                        rospy.loginfo(f"--> Ulaşıldı: {next_node_str}")
+                        rospy.sleep(0.5)
+                        self.publish_visualization(frame)
+                        rate.sleep()
+                        continue
+
+                    # Basit P kontrol
+                    kp_omega = 2.5
+                    omega = -kp_omega * x_err
+                    omega = max(-2.0, min(2.0, omega))
+
+                    v = 0.18
+                    if abs(x_err) > 0.15:
+                        v = 0.06
+
+                    self.drive(v, omega)
+
                 else:
-                    self.stop_robot()
+                    self.state = "SEARCHING"
+                    self.reach_counter = 0
 
-            self.publish_visualization(frame)
-            rospy.loginfo_throttle(0.5, f"Durum: {self.state} | Hedef: {next_node_str}")
-            rate.sleep()
+                    lost_time = rospy.Time.now().to_sec() - self.last_seen_time
+                    if lost_time > 0.5:
+                        if self.turn_mode:
+                            if self.search_turn_dir == 0.0:
+                                # Düz devam etmesi gerekiyorsa çok hafif ileri git
+                                self.drive(0.08, 0.0)
+                            else:
+                                # Sağa veya sola dön
+                                self.drive(0.0, 0.45 * self.search_turn_dir)
+                        else:
+                            self.drive(0.0, 0.45)
+                    else:
+                        self.stop_robot()
+
+                self.publish_visualization(frame)
+                rospy.loginfo_throttle(0.5, f"Durum: {self.state} | Hedef: {next_node_str}")
+                rate.sleep()
 
 
-if __name__ == "__main__":
-    try:
-        nav = AutonomousNavigator()
-        nav.run()
-    except rospy.ROSInterruptException:
-        pass
+    if __name__ == "__main__":
+        try:
+            nav = AutonomousNavigator()
+            nav.run()
+        except rospy.ROSInterruptException:
+            pass

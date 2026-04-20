@@ -264,35 +264,35 @@ class AutonomousNavigator:
 
     # dönüş yönü fonksiyonu
     def get_turn_direction(self):
-    # path başındaysa önceki yön bilinmiyor; varsayılan sağa dön
-    if self.path_index == 0:
-        return 1.0
-
-    prev_node = self.path[self.path_index - 1]
-    curr_node = self.path[self.path_index]
-    next_node = self.path[self.path_index + 1]
-
-    x0, y0 = COORDS[prev_node]
-    x1, y1 = COORDS[curr_node]
-    x2, y2 = COORDS[next_node]
-
-    v1 = (x1 - x0, y1 - y0)
-    v2 = (x2 - x1, y2 - y1)
-
-    cross = v1[0] * v2[1] - v1[1] * v2[0]
-    dot = v1[0] * v2[0] + v1[1] * v2[1]
-
-    # cross işaretine göre dönüş yönü seç
-    if cross > 0:
-        return 1.0
-    elif cross < 0:
-        return -1.0
-    else:
-        # aynı doğrultuysa düz; geri dönüşse sabit bir yön seç
-        if dot >= 0:
-            return 0.0
-        else:
+        # path başındaysa önceki yön bilinmiyor; varsayılan sağa dön
+        if self.path_index == 0:
             return 1.0
+
+        prev_node = self.path[self.path_index - 1]
+        curr_node = self.path[self.path_index]
+        next_node = self.path[self.path_index + 1]
+
+        x0, y0 = COORDS[prev_node]
+        x1, y1 = COORDS[curr_node]
+        x2, y2 = COORDS[next_node]
+
+        v1 = (x1 - x0, y1 - y0)
+        v2 = (x2 - x1, y2 - y1)
+
+        cross = v1[0] * v2[1] - v1[1] * v2[0]
+        dot = v1[0] * v2[0] + v1[1] * v2[1]
+
+        # cross işaretine göre dönüş yönü seç
+        if cross > 0:
+            return 1.0
+        elif cross < 0:
+            return -1.0
+        else:
+            # aynı doğrultuysa düz; geri dönüşse sabit bir yön seç
+            if dot >= 0:
+                return 0.0
+            else:
+                return 1.0
 
     def publish_visualization(self, frame):
         canvas = np.ones((MAP_H, MAP_W, 3), dtype=np.uint8) * 255

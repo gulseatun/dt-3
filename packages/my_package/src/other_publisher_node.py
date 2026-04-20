@@ -1,65 +1,176 @@
 #!/usr/bin/env python3
 import math
-import numpy as np
 import rospy
 import cv2
+import numpy as np
+
 from sensor_msgs.msg import CompressedImage
-from duckietown_msgs.msg import WheelEncoderStamped, Twist2DStamped
+from duckietown_msgs.msg import Twist2DStamped
+
 
 # =========================
-# CONFIG (Wolf Ayarları)
+# CONFIG
 # =========================
 ROBOT_NAME = "bear"
-CMD_VEL_TOPIC = f"/{ROBOT_NAME}/wheels_driver_node/wheels_cmd" 
+
+CMD_TOPIC = f"/{ROBOT_NAME}/car_cmd_switch_node/cmd"
 CAMERA_TOPIC = f"/{ROBOT_NAME}/camera_node/image/compressed"
-VIZ_PUB_TOPIC = f"/{ROBOT_NAME}/localization_viz/compressed"
+VIZ_PUB_TOPIC = f"/{ROBOT_NAME}/astar_nav_viz/compressed"
 
-# Fiziksel Sabitler (Madde 1: correct physical marker side length s)
-MARKER_SIZE_METERS = 0.065
-R, N, L = 0.0318, 135, 0.1
-METRE_PER_TICK = (2 * math.pi * R) / N
+MARKER_SIZE_METERS = 0.05
 
-# Kamera Kalibrasyon (Madde 1: calibrated K and d)
+# Reached kararı için daha güvenli eşikler
+REACH_DISTANCE = 0.095
+REACH_XERR = 0.15
+REQUIRED_REACH_COUNT = 2
+
 K = np.array([
-    [270.4563591302591,   0.0,               314.1813567017415],
-    [0.0,                 269.2951665378049, 218.88618596346137],
-    [0.0,                 0.0,               1.0]
+    [270.456,   0.0,     314.181],
+    [0.0,       269.295, 218.886],
+    [0.0,       0.0,     1.0]
 ], dtype=np.float32)
 
-D = np.array([
-    -0.19162991260105328,
-     0.026384790215657535,
-     0.005682129590129115,
-     0.0006647376545041703,
-     0.0
-], dtype=np.float32)
+D = np.array([-0.191, 0.026, 0.005, 0.0006, 0.0], dtype=np.float32)
+
+MAP_W = 700
+MAP_H = 700
+MAP_SCALE = 150.0
+MAP_ORIGIN = (100, 600)
 
 
-# Marker Haritası (Kendi pistine göre güncellemelisin)
-MARKER_MAP = {
-    11: {"x": 1.0, "y": 0.0, "yaw": 0.0},
-    32: {"x": 2.0, "y": 1.0, "yaw": math.pi / 2}
+# =========================
+# MAP + A*
+# =========================
+COORDS = {
+    0: (0, 0),   1: (1, 0),   2: (2, 0),   3: (3, 0),
+    4: (0, 1),   5: (1, 1),   6: (2, 1),   7: (3, 1),
+    8: (0, 2),   9: (1, 2),  10: (2, 2),  11: (3, 2),
+    12: (0, 3), 13: (1, 3),  14: (2, 3),  15: (3, 3)
 }
 
-# Harita Çizim Ayarları (Madde 3: Top-down map)
-MAP_W, MAP_H = 480, 480
-MAP_SCALE = 150.0  # 1 metre = 150 piksel
-MAP_ORIGIN = (40, 480)
+# PDF’ye göre düzeltilmiş graph
+GRAPH = {
+    0:  {1: 1.5, 4: 2.0},
+    1:  {0: 1.5, 2: 1.0, 5: 2.0},
+    2:  {1: 1.0, 3: 1.0, 6: 1.5},
+    3:  {2: 1.0},
 
-class Assignment2Node:
+    4:  {0: 2.0, 8: 1.5},
+    5:  {1: 2.0, 6: 1.0, 9: 2.0},
+    6:  {2: 1.5, 5: 1.0, 7: 0.5, 10: 4.0},
+    7:  {6: 0.5, 11: 1.5},
+
+    8:  {4: 1.5, 9: 1.5, 12: 2.0},
+    9:  {5: 2.0, 8: 1.5, 10: 2.0},
+    10: {6: 4.0, 9: 2.0, 11: 1.0, 14: 1.5},
+    11: {7: 1.5, 10: 1.0},
+
+    12: {8: 2.0, 13: 1.5},
+    13: {12: 1.5, 14: 2.0},
+    14: {10: 1.5, 13: 2.0, 15: 1.0},
+    15: {14: 1.0}
+}
+
+
+def heuristic(node, goal, method="manhattan"):
+    x1, y1 = COORDS[node]
+    x2, y2 = COORDS[goal]
+
+    if method == "manhattan":
+        return abs(x1 - x2) + abs(y1 - y2)
+    return math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2)
+
+
+def reconstruct_path(parent, current):
+    total_path = [current]
+    while current in parent and parent[current] is not None:
+        current = parent[current]
+        total_path.insert(0, current)
+    return total_path
+
+
+def a_star_search(start, goal):
+    if start not in COORDS or goal not in COORDS:
+        return [], float("inf")
+
+    if start == goal:
+        return [start], 0.0
+
+    # (f, h, node)
+    open_list = [(heuristic(start, goal), heuristic(start, goal), start)]
+    closed_set = set()
+
+    g_costs = {node: float("inf") for node in COORDS}
+    g_costs[start] = 0.0
+    parent = {start: None}
+
+    while open_list:
+        open_list.sort(key=lambda x: (x[0], x[1]))
+        _, _, current = open_list.pop(0)
+
+        if current == goal:
+            return reconstruct_path(parent, current), g_costs[goal]
+
+        closed_set.add(current)
+
+        for neighbor, move_cost in GRAPH[current].items():
+            if neighbor in closed_set:
+                continue
+
+            tentative_g = g_costs[current] + move_cost
+
+            if tentative_g < g_costs.get(neighbor, float("inf")):
+                parent[neighbor] = current
+                g_costs[neighbor] = tentative_g
+                h_val = heuristic(neighbor, goal, method="manhattan")
+                f_val = tentative_g + h_val
+
+                open_list = [item for item in open_list if item[2] != neighbor]
+                open_list.append((f_val, h_val, neighbor))
+
+    return [], float("inf")
+
+
+def world_to_map_px(x, y):
+    px = int(MAP_ORIGIN[0] + x * MAP_SCALE)
+    py = int(MAP_ORIGIN[1] - y * MAP_SCALE)
+    return px, py
+
+
+# =========================
+# MAIN NODE
+# =========================
+class AutonomousNavigator:
     def __init__(self):
-        rospy.init_node("assignment2_localization_node")
-        
-        # Robot Pozu ve Odometri Değişkenleri
-        self.x, self.y, self.yaw = 0.0, 0.0, 0.0
-        self.left_tick_prev, self.right_tick_prev = None, None
-        self.d_left, self.d_right = 0.0, 0.0
-        self.robot_dir = 1.0
-        self.last_frame = None
-        self.source = "FALLBACK" 
+        rospy.init_node("astar_navigator_node")
 
-        # ArUco Setup (OpenCV Sürüm Toleransı)
-        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_APRILTAG_36h11)
+        self.search_turn_dir = 1.0
+        self.turn_mode = False
+
+        self.start_node = 0
+        self.goal_node = 15
+
+        rospy.loginfo("A* Algoritması rotayı hesaplıyor...")
+        self.path, self.total_cost = a_star_search(self.start_node, self.goal_node)
+
+        if not self.path:
+            rospy.logerr("HATA: Hedefe giden yol bulunamadı!")
+            rospy.signal_shutdown("No path")
+            return
+
+        formatted_path = " -> ".join([f"N{n}" for n in self.path])
+        rospy.loginfo(f"Takip Edilecek Rota: {formatted_path}")
+        rospy.loginfo(f"Toplam Maliyet: {self.total_cost:.2f}")
+
+        self.path_index = 0
+        self.current_node = self.start_node
+        self.state = "STARTING"
+
+        self.reach_counter = 0
+        self.last_seen_time = rospy.Time.now().to_sec()
+
+        # Eğer sahada AprilTag kullanıyorsanız bu doğru seçim
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_100)
         try:
             self.aruco_params = cv2.aruco.DetectorParameters()
             self.detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
@@ -68,135 +179,272 @@ class Assignment2Node:
             self.aruco_params = cv2.aruco.DetectorParameters_create()
             self.new_api = False
 
-        # Publisher (Madde 3: Görselleştirme Yayını)
+        self.last_frame = None
+        self.visible_tags = {}
+
+        self.cmd_pub = rospy.Publisher(CMD_TOPIC, Twist2DStamped, queue_size=1)
         self.viz_pub = rospy.Publisher(VIZ_PUB_TOPIC, CompressedImage, queue_size=1)
 
-        # Subscribers
         rospy.Subscriber(CAMERA_TOPIC, CompressedImage, self.image_cb, queue_size=1, buff_size=2**24)
-        rospy.Subscriber(f"/{ROBOT_NAME}/left_wheel_encoder_node/tick", WheelEncoderStamped, self.left_cb)
-        rospy.Subscriber(f"/{ROBOT_NAME}/right_wheel_encoder_node/tick", WheelEncoderStamped, self.right_cb)
-        rospy.Subscriber(CMD_VEL_TOPIC, Twist2DStamped, self.cmd_cb)
 
-        rospy.loginfo("Assignment 2 Node Başlatıldı. rqt_image_view ile yayını izleyebilirsin.")
-
-    def cmd_cb(self, msg): self.robot_dir = 1.0 if msg.v >= 0 else -1.0
-    
-    def left_cb(self, msg):
-        if self.left_tick_prev is not None: self.d_left += (msg.data - self.left_tick_prev) * METRE_PER_TICK * self.robot_dir
-        self.left_tick_prev = msg.data
-        
-    def right_cb(self, msg):
-        if self.right_tick_prev is not None: self.d_right += (msg.data - self.right_tick_prev) * METRE_PER_TICK * self.robot_dir
-        self.right_tick_prev = msg.data
-        
     def image_cb(self, msg):
         np_arr = np.frombuffer(msg.data, np.uint8)
         self.last_frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    def draw_map(self):
-        # Boş beyaz harita
+    def drive(self, v, omega):
+        msg = Twist2DStamped()
+        msg.header.stamp = rospy.Time.now()
+        msg.v = v
+        msg.omega = omega
+        self.cmd_pub.publish(msg)
+
+    def stop_robot(self):
+        self.drive(0.0, 0.0)
+
+    def detect_markers(self, gray):
+        if self.new_api:
+            corners, ids, _ = self.detector.detectMarkers(gray)
+        else:
+            corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+        return corners, ids
+
+    def process_detections(self, frame, corners, ids):
+        self.visible_tags = {}
+
+        if ids is None or len(ids) == 0:
+            return
+
+        obj_pts = np.array([
+            [-MARKER_SIZE_METERS / 2,  MARKER_SIZE_METERS / 2, 0],
+            [ MARKER_SIZE_METERS / 2,  MARKER_SIZE_METERS / 2, 0],
+            [ MARKER_SIZE_METERS / 2, -MARKER_SIZE_METERS / 2, 0],
+            [-MARKER_SIZE_METERS / 2, -MARKER_SIZE_METERS / 2, 0]
+        ], dtype=np.float32)
+
+        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+
+        for i, marker_id in enumerate(ids.flatten()):
+            marker_id = int(marker_id)
+            if marker_id not in COORDS:
+                continue
+
+            image_pts = corners[i].reshape((4, 2)).astype(np.float32)
+            success, rvec, tvec = cv2.solvePnP(
+                obj_pts, image_pts, K, D, flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+
+            if not success:
+                continue
+
+            cv2.drawFrameAxes(frame, K, D, rvec, tvec, MARKER_SIZE_METERS * 0.5)
+
+            node_name = f"N{marker_id}"
+            x_err = float(tvec[0][0])
+            dist = float(tvec[2][0])
+
+            self.visible_tags[node_name] = {
+                "x_err": x_err,
+                "dist": dist
+            }
+
+            c = image_pts.mean(axis=0).astype(int)
+            cv2.putText(
+                frame,
+                f"{node_name} x:{x_err:.2f} d:{dist:.2f}",
+                (c[0] - 55, c[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 255, 0),
+                1,
+                cv2.LINE_AA
+            )
+
+        if self.visible_tags:
+            self.last_seen_time = rospy.Time.now().to_sec()
+
+    # dönüş yönü fonksiyonu
+    def get_turn_direction(self):
+    # path başındaysa önceki yön bilinmiyor; varsayılan sağa dön
+    if self.path_index == 0:
+        return 1.0
+
+    prev_node = self.path[self.path_index - 1]
+    curr_node = self.path[self.path_index]
+    next_node = self.path[self.path_index + 1]
+
+    x0, y0 = COORDS[prev_node]
+    x1, y1 = COORDS[curr_node]
+    x2, y2 = COORDS[next_node]
+
+    v1 = (x1 - x0, y1 - y0)
+    v2 = (x2 - x1, y2 - y1)
+
+    cross = v1[0] * v2[1] - v1[1] * v2[0]
+    dot = v1[0] * v2[0] + v1[1] * v2[1]
+
+    # cross işaretine göre dönüş yönü seç
+    if cross > 0:
+        return 1.0
+    elif cross < 0:
+        return -1.0
+    else:
+        # aynı doğrultuysa düz; geri dönüşse sabit bir yön seç
+        if dot >= 0:
+            return 0.0
+        else:
+            return 1.0
+
+    def publish_visualization(self, frame):
         canvas = np.ones((MAP_H, MAP_W, 3), dtype=np.uint8) * 255
-        cv2.putText(canvas, "Top-Down Map", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        
-        # Markerları Çiz
-        for m_id, data in MARKER_MAP.items():
-            px, py = int(MAP_ORIGIN[0] + data["x"] * MAP_SCALE), int(MAP_ORIGIN[1] - data["y"] * MAP_SCALE)
-            cv2.circle(canvas, (px, py), 5, (255, 0, 0), -1)
-            cv2.putText(canvas, f"ID:{m_id}", (px+10, py-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
 
-        # Robotu Çiz
-        rx, ry = int(MAP_ORIGIN[0] + self.x * MAP_SCALE), int(MAP_ORIGIN[1] - self.y * MAP_SCALE)
-        
-        # Madde 3: Duruma göre renk değiştirme (ArUco: Yeşil, Odom: Kırmızı)
-        color = (0, 200, 0) if "ARUCO" in self.source else (0, 0, 200) 
-        
-        cv2.circle(canvas, (rx, ry), 8, color, -1)
-        endx = int(rx + 25 * math.cos(self.yaw))
-        endy = int(ry - 25 * math.sin(self.yaw))
-        cv2.arrowedLine(canvas, (rx, ry), (endx, endy), color, 3, tipLength=0.3)
+        for n1, nbrs in GRAPH.items():
+            x1, y1 = COORDS[n1]
+            p1 = world_to_map_px(x1, y1)
 
-        # Bilgi Yazıları
-        cv2.putText(canvas, f"State: {self.source}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-        cv2.putText(canvas, f"X:{self.x:.2f} Y:{self.y:.2f} Yaw:{math.degrees(self.yaw):.0f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-        
-        return canvas
+            for n2, cost in nbrs.items():
+                x2, y2 = COORDS[n2]
+                p2 = world_to_map_px(x2, y2)
+
+                if n1 < n2:
+                    cv2.line(canvas, p1, p2, (180, 180, 180), 2)
+                    mx = (p1[0] + p2[0]) // 2
+                    my = (p1[1] + p2[1]) // 2
+                    cv2.putText(
+                        canvas, str(cost), (mx - 10, my + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA
+                    )
+
+        for node_id, (x, y) in COORDS.items():
+            px, py = world_to_map_px(x, y)
+            color = (0, 165, 255) if node_id in self.path else (255, 0, 0)
+            cv2.circle(canvas, (px, py), 14, color, -1)
+            cv2.putText(
+                canvas, f"N{node_id}", (px - 15, py - 20),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, cv2.LINE_AA
+            )
+
+        rx, ry = world_to_map_px(COORDS[self.current_node][0], COORDS[self.current_node][1])
+        cv2.circle(canvas, (rx, ry), 10, (0, 255, 0), -1)
+        cv2.putText(
+            canvas, "ROBOT", (rx + 15, ry + 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 150, 0), 2, cv2.LINE_AA
+        )
+
+        cv2.putText(
+            canvas, "Path: " + " -> ".join([f"N{n}" for n in self.path]),
+            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2
+        )
+        cv2.putText(
+            canvas, f"Current node: N{self.current_node}",
+            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2
+        )
+
+        if self.path_index < len(self.path) - 1:
+            cv2.putText(
+                canvas, f"Next target: N{self.path[self.path_index + 1]}",
+                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2
+            )
+
+        h, w = frame.shape[:2]
+        new_w = int((MAP_H / h) * w)
+        frame_resized = cv2.resize(frame, (new_w, MAP_H))
+        combined = np.hstack([frame_resized, canvas])
+
+        msg = CompressedImage()
+        msg.header.stamp = rospy.Time.now()
+        msg.format = "jpeg"
+        msg.data = np.array(cv2.imencode(".jpg", combined)[1]).tobytes()
+        self.viz_pub.publish(msg)
 
     def run(self):
         rate = rospy.Rate(10)
+
         while not rospy.is_shutdown():
-            # --- Madde 2: Fallback Localization (Wheel Odometry) ---
-            dist = (self.d_right + self.d_left) / 2.0
-            d_phi = (self.d_right - self.d_left) / L
-            self.x += dist * math.cos(self.yaw)
-            self.y += dist * math.sin(self.yaw)
-            self.yaw = math.atan2(math.sin(self.yaw + d_phi), math.cos(self.yaw + d_phi))
-            self.d_left, self.d_right = 0.0, 0.0
-            self.source = "FALLBACK (Odom)"
+            if self.path_index >= len(self.path) - 1:
+                self.stop_robot()
+                rospy.loginfo("Goal Reached")
+                break
 
-            if self.last_frame is not None:
-                # Undistort Image
-                frame = cv2.undistort(self.last_frame.copy(), K, D)
-                
-                # EKLENECEK SATIR: Görüntüyü Gri Tonlamaya (Grayscale) Çevir
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
-                # DEĞİŞECEK SATIR: 'frame' yerine 'gray' veriyoruz
-                if self.new_api: 
-                    corners, ids, _ = self.detector.detectMarkers(gray)
-                else: 
-                    corners, ids, _ = cv2.aruco.detectMarkers(gray, self.aruco_dict, parameters=self.aruco_params)
+            if self.last_frame is None:
+                self.stop_robot()
+                rate.sleep()
+                continue
 
-                if ids is not None:
-                    # Sınırları çiz (Ödev isteri 1.4)
-                    cv2.aruco.drawDetectedMarkers(frame, corners, ids)
-                    
-                    for i, m_id in enumerate(ids.flatten()):
-                        # KRİTİK DÜZELTME: Gelen Numpy değerini standart int formatına çevir
-                        m_id_int = int(m_id)
-                        
-                        # Pose Estimation
-                        obj_pts = np.array([[-MARKER_SIZE_METERS/2, MARKER_SIZE_METERS/2, 0],
-                                            [MARKER_SIZE_METERS/2, MARKER_SIZE_METERS/2, 0],
-                                            [MARKER_SIZE_METERS/2, -MARKER_SIZE_METERS/2, 0],
-                                            [-MARKER_SIZE_METERS/2, -MARKER_SIZE_METERS/2, 0]], dtype=np.float32)
-                        
-                        success, rvec, tvec = cv2.solvePnP(obj_pts, corners[i], K, D)
-                        if success:
-                            # Eksenleri çiz (Ödev isteri 1.4)
-                            cv2.drawFrameAxes(frame, K, D, rvec, tvec, 0.05)
-                            
-                            # MADDE 1 EKSİĞİ GİDERİLDİ: "Log the estimated pose for each detected tag ID"
-                            rospy.loginfo_throttle(0.5, f"[Madde 1] ID: {m_id_int} Pose -> tvec: {tvec.flatten()}, rvec: {rvec.flatten()}")
-                            
-                            # Eğer görülen ID haritamızda varsa konumu güncelle
-                            if m_id_int in MARKER_MAP:
-                                target = MARKER_MAP[m_id_int]
-                                self.x = (0.7 * self.x) + (0.3 * target["x"])
-                                self.y = (0.7 * self.y) + (0.3 * target["y"])
-                                self.source = f"ARUCO_FIX (ID:{m_id_int})"
+            frame = cv2.undistort(self.last_frame.copy(), K, D)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-                # --- Madde 3: Live Visualization Birleştirme ve Yayınlama ---
-                h, w = frame.shape[:2]
-                new_w = int((MAP_H / h) * w)
-                frame_resized = cv2.resize(frame, (new_w, MAP_H))
-                map_img = self.draw_map()
-                
-                # Yan yana birleştir
-                combined_img = np.hstack([frame_resized, map_img])
+            corners, ids = self.detect_markers(gray)
+            self.process_detections(frame, corners, ids)
 
-                # Publisher için CompressedImage formatına çevir
-                msg = CompressedImage()
-                msg.header.stamp = rospy.Time.now()
-                msg.format = "jpeg"
-                msg.data = np.array(cv2.imencode('.jpg', combined_img)[1]).tobytes()
-                self.viz_pub.publish(msg)
-            
-            # Ana döngü logu
-            rospy.loginfo_throttle(0.5, f"[{self.source}] X: {self.x:.2f} m, Y: {self.y:.2f} m, Yaw: {math.degrees(self.yaw):.0f}°, Dir: {'FWD' if self.robot_dir > 0 else 'BWD'}")
+            next_node_id = self.path[self.path_index + 1]
+            next_node_str = f"N{next_node_id}"
+
+            if next_node_str in self.visible_tags:
+                self.turn_mode = False
+                self.state = "TRACKING"
+                tag_info = self.visible_tags[next_node_str]
+                x_err = tag_info["x_err"]
+                dist = tag_info["dist"]
+
+                rospy.loginfo_throttle(
+                    0.2,
+                    f"Durum:{self.state} | Hedef:{next_node_str} | x_err:{x_err:.3f} | dist:{dist:.3f} | cnt:{self.reach_counter}"
+                )
+
+                # Daha güvenli reached koşulu
+                if dist < REACH_DISTANCE and abs(x_err) < REACH_XERR:
+                    self.reach_counter += 1
+                else:
+                    self.reach_counter = 0
+
+                if self.reach_counter >= REQUIRED_REACH_COUNT:
+                    self.stop_robot()
+                    self.current_node = next_node_id
+                    self.path_index += 1
+                    self.reach_counter = 0
+
+                    if self.path_index < len(self.path) - 1:
+                        self.search_turn_dir = self.get_turn_direction()
+                        self.turn_mode = True
+
+                    rospy.loginfo(f"--> Ulaşıldı: {next_node_str}")
+                    rospy.sleep(0.5)
+                    self.publish_visualization(frame)
+                    rate.sleep()
+                    continue
+
+                # Basit P kontrol
+                kp_omega = 2.5
+                omega = -kp_omega * x_err
+                omega = max(-2.0, min(2.0, omega))
+
+                v = 0.18
+                if abs(x_err) > 0.15:
+                    v = 0.06
+
+                self.drive(v, omega)
+
+            else:
+                self.state = "SEARCHING"
+                self.reach_counter = 0
+
+                if self.turn_mode:
+                    if self.search_turn_dir == 0.0:
+                        # düz devam etmesi gerekiyorsa çok hafif ileri git
+                        self.drive(0.08, 0.0)
+                    else:
+                        self.drive(0.0, 0.35 * self.search_turn_dir)
+                else:
+                    self.drive(0.0, 0.25)
+
+            self.publish_visualization(frame)
+            rospy.loginfo_throttle(0.5, f"Durum: {self.state} | Hedef: {next_node_str}")
             rate.sleep()
+
 
 if __name__ == "__main__":
     try:
-        Assignment2Node().run()
+        nav = AutonomousNavigator()
+        nav.run()
     except rospy.ROSInterruptException:
         pass

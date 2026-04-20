@@ -13,12 +13,12 @@ from duckietown_msgs.msg import Twist2DStamped
 # =========================
 ROBOT_NAME = "bear"
 
-CMD_TOPIC = f"/{ROBOT_NAME}/wheels_driver_node/wheels_cmd"
+CMD_TOPIC = f"/{ROBOT_NAME}/car_cmd_switch_node/cmd"
 CAMERA_TOPIC = f"/{ROBOT_NAME}/camera_node/image/compressed"
 VIZ_PUB_TOPIC = f"/{ROBOT_NAME}/astar_nav_viz/compressed"
 
-MARKER_SIZE_METERS = 0.065
-REACH_THRESHOLD = 0.30
+MARKER_SIZE_METERS = 0.05
+REACH_THRESHOLD = 0.08
 
 # Kamera kalibrasyonu (senin önceki koddakiyle aynı)
 K = np.array([
@@ -452,7 +452,7 @@ class Assignment3Node:
                 x_err = info["x_err"]
                 dist = info["distance"]
 
-                if dist < 0.05 and abs(x_err) < 0.05:
+                if dist < REACH_THRESHOLD and abs(x_err) < 0.05:
                     self.current_node = next_node
                     self.path_index += 1
                     self.stop_robot()
